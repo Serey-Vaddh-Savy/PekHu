@@ -1,12 +1,19 @@
 import { useState, useRef, useEffect, KeyboardEvent, ChangeEvent } from "react";
 import { Send, Paperclip, Smile, Mic, X, Bot, File } from "lucide-react";
-import { sendChatMessage } from "../data/chatApi";
+import { sendChatMessage, type ChatHistoryMessage } from "../../backend/chatApi";
 import { type Provider } from "../data/api";
+import ResponseChat from "./ResponseChat";
+import QuestionChat, { type QuestionAnswer } from "./QuestionChat";
+
+type AssistantResponse =
+    | { type: "answer"; content: string }
+    | { type: "question"; questions: string[] };
 
 interface Message {
     id: number;
     role: "user" | "assistant";
     content: string;
+    response?: AssistantResponse;
     file?: string;
     time: string;
 }
@@ -19,6 +26,7 @@ const INITIAL_MESSAGES: Message[] = [
         id: 1,
         role: "assistant",
         content: "Hi there! I'm PekHu AI. How can I help you today?",
+        response: { type: "answer", content: "Hi there! I'm PekHu AI. How can I help you today?" },
         time: "10:01 AM",
     },
 ];
@@ -39,6 +47,112 @@ function getSavedKeyForProvider(provider: Provider | null): string | null {
     } catch {
         return null;
     }
+}
+
+function getJsonArrayCandidate(reply: string) {
+    const trimmed = reply.trim();
+    const withoutFence = trimmed
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim();
+    const start = withoutFence.indexOf("[");
+    const end = withoutFence.lastIndexOf("]");
+
+    if (start >= 0 && end > start) {
+        return withoutFence.slice(start, end + 1);
+    }
+
+    return withoutFence;
+}
+
+function parseLooseAssistantArray(reply: string): AssistantResponse | null {
+    const candidate = getJsonArrayCandidate(reply);
+    const match = candidate.match(/^\[\s*["'](answer|question)["']\s*,\s*([\s\S]*)\]\s*$/i);
+
+    if (!match) return null;
+
+    const responseType = match[1].toLowerCase();
+    const rawParts = match[2].trim();
+    const parts = Array.from(rawParts.matchAll(/["']([\s\S]*?)["'](?=\s*,|\s*$)/g))
+        .map((part) => part[1].trim())
+        .filter(Boolean);
+
+    if (responseType === "question") {
+        return {
+            type: "question",
+            questions: parts.length > 0 ? parts : ["Can you clarify what you mean?"],
+        };
+    }
+
+    return {
+        type: "answer",
+        content: parts.join("\n\n") || "(empty response)",
+    };
+}
+
+function parseAssistantResponse(reply: string): AssistantResponse {
+    try {
+        const parsed = JSON.parse(getJsonArrayCandidate(reply));
+
+        if (!Array.isArray(parsed) || typeof parsed[0] !== "string") {
+            return { type: "answer", content: reply };
+        }
+
+        const responseType = parsed[0].toLowerCase();
+        const parts = parsed.slice(1).map((item) => String(item).trim()).filter(Boolean);
+
+        if (responseType === "question") {
+            return {
+                type: "question",
+                questions: parts.length > 0 ? parts : ["Can you clarify what you mean?"],
+            };
+        }
+
+        if (responseType === "answer") {
+            return {
+                type: "answer",
+                content: parts.join("\n\n") || "(empty response)",
+            };
+        }
+    } catch {
+        return parseLooseAssistantArray(reply) ?? { type: "answer", content: reply };
+    }
+
+    return { type: "answer", content: reply };
+}
+
+function buildQuestionAnswerMessage(answers: QuestionAnswer[]) {
+    return [
+        "Here are my answers to your clarifying questions:",
+        "",
+        ...answers.map((item, index) => {
+            const answer = item.skipped ? "Skipped" : item.answer;
+
+            return `Q${index + 1}: ${item.question}\nA${index + 1}: ${answer}`;
+        }),
+    ].join("\n");
+}
+
+function getAssistantHistoryContent(message: Message) {
+    const response = message.response ?? parseAssistantResponse(message.content);
+
+    if (response.type === "answer") {
+        return response.content;
+    }
+
+    return [
+        "Clarifying questions asked:",
+        ...response.questions.map((question, index) => `${index + 1}. ${question}`),
+    ].join("\n");
+}
+
+function buildChatHistory(messages: Message[]): ChatHistoryMessage[] {
+    return messages
+        .filter((message) => message.content.trim() || message.role === "assistant")
+        .map((message) => ({
+            role: message.role,
+            content: message.role === "assistant" ? getAssistantHistoryContent(message) : message.content,
+        }));
 }
 
 export default function ChatArea({ provider, model }: ChatAreaProps) {
@@ -66,37 +180,20 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
         if (e.target.files?.[0]) setFile(e.target.files[0]);
     };
 
-    const sendMessage = async () => {
-        const text = input.trim();
-        if (!text && !file) return;
+    const submitUserMessage = async (rawText: string, fileName?: string) => {
+        const text = rawText.trim();
+        if (!text && !fileName) return;
         setMessageResponding(true);
 
         const userMsg: Message = {
             id: Date.now(),
             role: "user",
-            content: text,
-            file: file?.name,
+            content: rawText,
+            file: fileName,
             time: now(),
         };
+        const nextMessages = [...messages, userMsg];
         setMessages((prev) => [...prev, userMsg]);
-        setInput("");
-        setFile(null);
-        if (fileInputRef.current) fileInputRef.current.value = "";
-        if (textareaRef.current) textareaRef.current.style.height = "auto";
-
-        if (provider && provider !== "DeepSeek") {
-            setMessages((prev) => [
-                ...prev,
-                {
-                    id: Date.now() + 1,
-                    role: "assistant",
-                    content: "Only DeepSeek is wired right now. Switch the provider to DeepSeek to chat.",
-                    time: now(),
-                },
-            ]);
-            setMessageResponding(false);
-            return;
-        }
 
         if (!text) {
             setMessages((prev) => [
@@ -114,19 +211,25 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
 
         setIsTyping(true);
         try {
-            const apiKey = getSavedKeyForProvider("DeepSeek");
+            const selectedProvider = provider ?? "DeepSeek";
+            const apiKey = getSavedKeyForProvider(selectedProvider);
             const response = await sendChatMessage({
-                message: text,
+                message: rawText,
+                history: buildChatHistory(nextMessages),
                 model: model ?? undefined,
+                provider: selectedProvider,
                 apiKey: apiKey ?? undefined,
             });
+            const reply = response.reply || "(empty response)";
+            const parsedReply = parseAssistantResponse(reply);
 
             setMessages((prev) => [
                 ...prev,
                 {
                     id: Date.now() + 1,
                     role: "assistant",
-                    content: response.reply || "(empty response)",
+                    content: parsedReply.type === "answer" ? parsedReply.content : reply,
+                    response: parsedReply,
                     time: now(),
                 },
             ]);
@@ -147,6 +250,24 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
         }
     };
 
+    const sendMessage = async () => {
+        const rawText = input;
+        const fileName = file?.name;
+
+        if (!rawText.trim() && !fileName) return;
+
+        setInput("");
+        setFile(null);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        if (textareaRef.current) textareaRef.current.style.height = "auto";
+
+        await submitUserMessage(rawText, fileName);
+    };
+
+    const sendQuestionAnswers = async (answers: QuestionAnswer[]) => {
+        await submitUserMessage(buildQuestionAnswerMessage(answers));
+    };
+
     const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
         if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
@@ -159,14 +280,24 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
 
     return (
         <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex-1 overflow-y-auto thin-scrollbar px-4 py-5 space-y-4 scroll-smooth">
+            <div className="flex-1 overflow-y-auto thin-scrollbar px-4 py-6 space-y-7 scroll-smooth">
                 {messages.map((msg) => {
                     if (msg.role === "assistant") {
+                        const response = msg.response ?? parseAssistantResponse(msg.content);
+
                         return (
                             <div key={msg.id} className="w-full">
-                                <div className="max-w-[72%]">
-                                    <div className="text-sm leading-relaxed text-foreground text-left">
-                                        {msg.content}
+                                <div className="max-w-[76%]">
+                                    <div className="text-[15px] leading-7 text-foreground text-left">
+                                        {response.type === "question" ? (
+                                            <QuestionChat
+                                                questions={response.questions}
+                                                disabled={messageResponding}
+                                                onComplete={sendQuestionAnswers}
+                                            />
+                                        ) : (
+                                            <ResponseChat content={response.content} />
+                                        )}
                                     </div>
                                 </div>
                             </div>
@@ -184,7 +315,7 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
                                 )}
 
                                 {msg.content && (
-                                    <div className={`px-3.5 py-2.5 rounded-[10px] text-sm leading-relaxed bg-foreground text-background`}>
+                                    <div className={`whitespace-pre-wrap break-words px-3.5 py-2.5 rounded-[10px] text-sm leading-relaxed bg-foreground text-background`}>
                                         {msg.content}
                                     </div>
                                 )}
