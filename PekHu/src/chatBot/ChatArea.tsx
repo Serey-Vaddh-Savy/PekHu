@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, KeyboardEvent, ChangeEvent } from "react";
+import { useState, useRef, useEffect, KeyboardEvent, ChangeEvent, type Dispatch, type SetStateAction } from "react";
 import { Send, Paperclip, Smile, Mic, X, Bot, File } from "lucide-react";
 import { sendChatMessage, type ChatHistoryMessage } from "../../backend/chatApi";
 import { type Provider } from "../data/api";
@@ -9,7 +9,7 @@ type AssistantResponse =
     | { type: "answer"; content: string }
     | { type: "question"; questions: string[] };
 
-interface Message {
+export interface Message {
     id: number;
     role: "user" | "assistant";
     content: string;
@@ -21,7 +21,9 @@ interface Message {
 const now = () =>
     new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-const INITIAL_MESSAGES: Message[] = [
+const CHAT_TEXTAREA_MAX_HEIGHT = 250;
+
+export const INITIAL_MESSAGES: Message[] = [
     {
         id: 1,
         role: "assistant",
@@ -34,9 +36,17 @@ const INITIAL_MESSAGES: Message[] = [
 interface ChatAreaProps {
     provider: Provider | null;
     model: string | null;
+    messages: Message[];
+    setMessages: Dispatch<SetStateAction<Message[]>>;
+    pendingContext?: string;
+    onPendingContextSent?: () => void;
 }
 
-function getSavedKeyForProvider(provider: Provider | null): string | null {
+export function createInitialMessages() {
+    return INITIAL_MESSAGES.map((message) => ({ ...message }));
+}
+
+export function getSavedKeyForProvider(provider: Provider | null): string | null {
     if (!provider) return null;
     try {
         const raw = localStorage.getItem("peakhu_api_keys");
@@ -90,7 +100,7 @@ function parseLooseAssistantArray(reply: string): AssistantResponse | null {
     };
 }
 
-function parseAssistantResponse(reply: string): AssistantResponse {
+export function parseAssistantResponse(reply: string): AssistantResponse {
     try {
         const parsed = JSON.parse(getJsonArrayCandidate(reply));
 
@@ -146,7 +156,7 @@ function getAssistantHistoryContent(message: Message) {
     ].join("\n");
 }
 
-function buildChatHistory(messages: Message[]): ChatHistoryMessage[] {
+export function buildChatHistory(messages: Message[]): ChatHistoryMessage[] {
     return messages
         .filter((message) => message.content.trim() || message.role === "assistant")
         .map((message) => ({
@@ -155,8 +165,14 @@ function buildChatHistory(messages: Message[]): ChatHistoryMessage[] {
         }));
 }
 
-export default function ChatArea({ provider, model }: ChatAreaProps) {
-    const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
+export default function ChatArea({
+    provider,
+    model,
+    messages,
+    setMessages,
+    pendingContext,
+    onPendingContextSent,
+}: ChatAreaProps) {
     const [input, setInput] = useState("");
     const [file, setFile] = useState<File | null>(null);
     const [isTyping, setIsTyping] = useState(false);
@@ -173,7 +189,8 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
         const el = textareaRef.current;
         if (!el) return;
         el.style.height = "auto";
-        el.style.height = Math.min(el.scrollHeight, 120) + "px";
+        el.style.height = Math.min(el.scrollHeight, CHAT_TEXTAREA_MAX_HEIGHT) + "px";
+        el.style.overflowY = el.scrollHeight > CHAT_TEXTAREA_MAX_HEIGHT ? "auto" : "hidden";
     };
 
     const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
@@ -213,15 +230,27 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
         try {
             const selectedProvider = provider ?? "DeepSeek";
             const apiKey = getSavedKeyForProvider(selectedProvider);
+            const hiddenContextMessage: Message | null = pendingContext?.trim()
+                ? {
+                    id: Date.now() - 1,
+                    role: "user",
+                    content: pendingContext,
+                    time: now(),
+                }
+                : null;
+            const historyMessages = hiddenContextMessage
+                ? [...messages, hiddenContextMessage, userMsg]
+                : nextMessages;
             const response = await sendChatMessage({
                 message: rawText,
-                history: buildChatHistory(nextMessages),
+                history: buildChatHistory(historyMessages),
                 model: model ?? undefined,
                 provider: selectedProvider,
                 apiKey: apiKey ?? undefined,
             });
             const reply = response.reply || "(empty response)";
             const parsedReply = parseAssistantResponse(reply);
+            onPendingContextSent?.();
 
             setMessages((prev) => [
                 ...prev,
@@ -315,7 +344,7 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
                                 )}
 
                                 {msg.content && (
-                                    <div className={`whitespace-pre-wrap break-words px-3.5 py-2.5 rounded-[10px] text-sm leading-relaxed bg-foreground text-background`}>
+                                    <div className="whitespace-pre-wrap break-words rounded-[10px] border border-sky-200 bg-sky-100 px-3.5 py-2.5 text-sm leading-relaxed text-sky-950">
                                         {msg.content}
                                     </div>
                                 )}
@@ -328,7 +357,7 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
 
                 {isTyping && (
                     <div className="flex items-end gap-2.5">
-                        <div className="size-7 rounded-full bg-foreground text-background flex items-center justify-center shrink-0">
+                        <div className="size-7 rounded-full bg-sky-100 text-sky-700 flex items-center justify-center shrink-0">
                             <Bot className="size-3.5" />
                         </div>
                         <div className="bg-muted border border-border/40 rounded-2xl rounded-bl-sm px-4 py-3.5 flex items-center gap-1">
@@ -346,8 +375,8 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
                 <div ref={bottomRef} />
             </div>
 
-            <div className="border-t border-border/60 p-3 bg-background/80 backdrop-blur shrink-0">
-                <div className="rounded-xl border border-border/60 bg-muted/40 focus-within:border-border transition-colors overflow-hidden">
+            <div className="p-3 shrink-0">
+                <div className="rounded-xl border border-border/60 bg-background shadow-sm focus-within:border-border transition-colors overflow-hidden">
                     {file && (
                         <div className="flex items-center gap-1.5 w-fit bg-background border border-border/60 rounded-lg px-2.5 py-1.5">
                             <File className="size-3 text-muted-foreground shrink-0" />
@@ -376,7 +405,7 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
                         onKeyDown={handleKeyDown}
                         placeholder="Message PekHu AI..."
                         rows={1}
-                        className="w-full bg-transparent resize-none outline-none px-3.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground leading-relaxed min-h-[40px] max-h-[120px]"
+                        className="thin-scrollbar w-full bg-transparent resize-none outline-none px-3.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground leading-relaxed min-h-[40px] max-h-[300px] overflow-y-hidden"
                     />
 
                     <div className="flex items-center gap-1 px-2 pb-2.5 pt-1">
@@ -411,7 +440,7 @@ export default function ChatArea({ provider, model }: ChatAreaProps) {
                         <button
                             onClick={sendMessage}
                             disabled={!canSend}
-                            className="flex items-center gap-1.5 h-7 px-3 rounded-lg bg-foreground text-background text-xs font-medium disabled:opacity-30 hover:opacity-80 transition-opacity"
+                            className="flex items-center gap-1.5 h-7 px-3 rounded-lg bg-sky-600 text-white text-xs font-medium disabled:opacity-30 hover:bg-sky-700 transition-colors"
                         >
                             Send
                             <Send className="size-3" />
