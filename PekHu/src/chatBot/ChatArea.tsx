@@ -1,13 +1,24 @@
 import { useState, useRef, useEffect, KeyboardEvent, ChangeEvent, type Dispatch, type SetStateAction } from "react";
-import { Send, Paperclip, Smile, Mic, X, Bot, File } from "lucide-react";
+import { Send, Paperclip, Smile, Mic, X, Bot, File, Plus, ChevronDown } from "lucide-react";
 import { sendChatMessage, type ChatHistoryMessage } from "../../backend/chatApi";
 import { type Provider } from "../data/api";
 import ResponseChat from "./ResponseChat";
 import QuestionChat, { type QuestionAnswer } from "./QuestionChat";
 
-type AssistantResponse =
+type SingleAssistantResponse =
     | { type: "answer"; content: string }
-    | { type: "question"; questions: string[] };
+    | { type: "question"; questions: string[] }
+    | { type: "delegate"; delegateTask: string[] };
+
+type AssistantResponse =
+    | SingleAssistantResponse
+    | { type: "multi"; responses: SingleAssistantResponse[] };
+
+export type DelegatePayload = {
+    provider: string;
+    task: string;
+    attachedFile: string;
+};
 
 export interface Message {
     id: number;
@@ -22,6 +33,8 @@ const now = () =>
     new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
 const CHAT_TEXTAREA_MAX_HEIGHT = 250;
+const DELEGATED_RETURN_PREFIX = "Delegated AI response received.";
+const DELEGATED_RETURN_LABEL = "Delegated response received";
 
 export const INITIAL_MESSAGES: Message[] = [
     {
@@ -40,6 +53,8 @@ interface ChatAreaProps {
     setMessages: Dispatch<SetStateAction<Message[]>>;
     pendingContext?: string;
     onPendingContextSent?: () => void;
+    onDelegateResponse?: (delegate: DelegatePayload) => void;
+    externalResponding?: boolean;
 }
 
 export function createInitialMessages() {
@@ -59,12 +74,17 @@ export function getSavedKeyForProvider(provider: Provider | null): string | null
     }
 }
 
-function getJsonArrayCandidate(reply: string) {
+function stripJsonFence(reply: string) {
     const trimmed = reply.trim();
-    const withoutFence = trimmed
+
+    return trimmed
         .replace(/^```(?:json)?\s*/i, "")
         .replace(/\s*```$/i, "")
         .trim();
+}
+
+function getJsonArrayCandidate(reply: string) {
+    const withoutFence = stripJsonFence(reply);
     const start = withoutFence.indexOf("[");
     const end = withoutFence.lastIndexOf("]");
 
@@ -75,9 +95,131 @@ function getJsonArrayCandidate(reply: string) {
     return withoutFence;
 }
 
-function parseLooseAssistantArray(reply: string): AssistantResponse | null {
+const responseTypes = ["answer", "question", "delegate"] as const;
+type ResponseType = typeof responseTypes[number];
+
+function isResponseType(value: string): value is ResponseType {
+    return responseTypes.includes(value as ResponseType);
+}
+
+function isAllowedMultiResponse(responses: SingleAssistantResponse[]) {
+    if (responses.length !== 2) {
+        return false;
+    }
+
+    const types = responses.map((response) => response.type);
+    const hasAnswer = types.includes("answer");
+    const hasDelegate = types.includes("delegate");
+    const hasQuestion = types.includes("question");
+
+    return hasAnswer && (hasDelegate || hasQuestion) && !(hasDelegate && hasQuestion);
+}
+
+function parseSingleAssistantArray(value: unknown): SingleAssistantResponse | null {
+    if (!Array.isArray(value) || typeof value[0] !== "string") {
+        return null;
+    }
+
+    const responseType = value[0].toLowerCase();
+    if (!isResponseType(responseType)) {
+        return null;
+    }
+
+    const parts = value.slice(1).map((item) => String(item).trim()).filter(Boolean);
+
+    if (responseType === "question") {
+        return {
+            type: "question",
+            questions: parts.length > 0 ? parts : ["Can you clarify what you mean?"],
+        };
+    }
+
+    if (responseType === "delegate") {
+        return {
+            type: "delegate",
+            delegateTask: parts.length < 3 ? [] : parts,
+        };
+    }
+
+    return {
+        type: "answer",
+        content: parts.join("\n\n") || "(empty response)",
+    };
+}
+
+function parseAssistantArray(value: unknown): AssistantResponse | null {
+    const singleResponse = parseSingleAssistantArray(value);
+    if (singleResponse) {
+        return singleResponse;
+    }
+
+    if (!Array.isArray(value) || value.length === 0) {
+        return null;
+    }
+
+    const responses = value.map(parseSingleAssistantArray);
+    if (responses.some((response) => response == null)) {
+        return null;
+    }
+
+    const validResponses = responses as SingleAssistantResponse[];
+    if (validResponses.length === 1) {
+        return validResponses[0];
+    }
+
+    return isAllowedMultiResponse(validResponses) ? { type: "multi", responses: validResponses } : null;
+}
+
+function extractTopLevelJsonArrays(reply: string) {
+    const source = stripJsonFence(reply);
+    const arrays: string[] = [];
+    let depth = 0;
+    let start = -1;
+    let quote: string | null = null;
+    let escaped = false;
+
+    for (let index = 0; index < source.length; index += 1) {
+        const char = source[index];
+
+        if (quote) {
+            if (escaped) {
+                escaped = false;
+            } else if (char === "\\") {
+                escaped = true;
+            } else if (char === quote) {
+                quote = null;
+            }
+            continue;
+        }
+
+        if (char === "\"" || char === "'") {
+            quote = char;
+            continue;
+        }
+
+        if (char === "[") {
+            if (depth === 0) {
+                start = index;
+            }
+            depth += 1;
+            continue;
+        }
+
+        if (char === "]" && depth > 0) {
+            depth -= 1;
+            if (depth === 0 && start >= 0) {
+                arrays.push(source.slice(start, index + 1));
+                start = -1;
+            }
+        }
+    }
+
+    return arrays;
+}
+
+function parseLooseAssistantArray(reply: string): SingleAssistantResponse | null {
     const candidate = getJsonArrayCandidate(reply);
-    const match = candidate.match(/^\[\s*["'](answer|question)["']\s*,\s*([\s\S]*)\]\s*$/i);
+    const match = candidate.match(/^\[\s*["'](answer|question|delegate)["']\s*,\s*([\s\S]*)\]\s*$/i);
 
     if (!match) return null;
 
@@ -94,6 +236,13 @@ function parseLooseAssistantArray(reply: string): AssistantResponse | null {
         };
     }
 
+    if (responseType === "delegate") {
+        return {
+            type: "delegate",
+            delegateTask: parts.length < 3 ? [] : parts,
+        };
+    }
+
     return {
         type: "answer",
         content: parts.join("\n\n") || "(empty response)",
@@ -103,32 +252,43 @@ function parseLooseAssistantArray(reply: string): AssistantResponse | null {
 export function parseAssistantResponse(reply: string): AssistantResponse {
     try {
         const parsed = JSON.parse(getJsonArrayCandidate(reply));
+        const response = parseAssistantArray(parsed);
 
-        if (!Array.isArray(parsed) || typeof parsed[0] !== "string") {
-            return { type: "answer", content: reply };
-        }
-
-        const responseType = parsed[0].toLowerCase();
-        const parts = parsed.slice(1).map((item) => String(item).trim()).filter(Boolean);
-
-        if (responseType === "question") {
-            return {
-                type: "question",
-                questions: parts.length > 0 ? parts : ["Can you clarify what you mean?"],
-            };
-        }
-
-        if (responseType === "answer") {
-            return {
-                type: "answer",
-                content: parts.join("\n\n") || "(empty response)",
-            };
+        if (response) {
+            return response;
         }
     } catch {
-        return parseLooseAssistantArray(reply) ?? { type: "answer", content: reply };
+        // Fall through to loose parsing.
+    }
+
+    const topLevelArrays = extractTopLevelJsonArrays(reply);
+    if (topLevelArrays.length > 1) {
+        const responses = topLevelArrays.map((candidate) => {
+            try {
+                return parseSingleAssistantArray(JSON.parse(candidate));
+            } catch {
+                return parseLooseAssistantArray(candidate);
+            }
+        });
+
+        if (responses.every((response) => response != null)) {
+            const validResponses = responses as SingleAssistantResponse[];
+            if (isAllowedMultiResponse(validResponses)) {
+                return { type: "multi", responses: validResponses };
+            }
+        }
+    }
+
+    const looseSingleResponse = parseLooseAssistantArray(reply);
+    if (looseSingleResponse) {
+        return looseSingleResponse;
     }
 
     return { type: "answer", content: reply };
+}
+
+export function getAssistantResponseItems(response: AssistantResponse): SingleAssistantResponse[] {
+    return response.type === "multi" ? response.responses : [response];
 }
 
 function buildQuestionAnswerMessage(answers: QuestionAnswer[]) {
@@ -143,17 +303,116 @@ function buildQuestionAnswerMessage(answers: QuestionAnswer[]) {
     ].join("\n");
 }
 
-function getAssistantHistoryContent(message: Message) {
-    const response = message.response ?? parseAssistantResponse(message.content);
+export function getDelegatePayload(delegateTask: string[]): DelegatePayload | null {
+    if (delegateTask.length < 3) {
+        return null;
+    }
 
+    const [provider, task, ...attachedFiles] = delegateTask;
+
+    return {
+        provider,
+        task,
+        attachedFile: attachedFiles.join("\n"),
+    };
+}
+
+function getDelegatePayloads(response: AssistantResponse) {
+    return getAssistantResponseItems(response)
+        .filter((item) => item.type === "delegate")
+        .map((item) => getDelegatePayload(item.delegateTask))
+        .filter((item): item is DelegatePayload => item != null);
+}
+
+function formatDelegateTask(delegateTask: string[]) {
+    const delegate = getDelegatePayload(delegateTask);
+
+    if (!delegate) {
+        return "Delegation requested, but the response was missing provider, task, or file context.";
+    }
+
+    return [
+        "Delegation requested:",
+        `Provider: ${delegate.provider}`,
+        `Task: ${delegate.task}`,
+        `Attached file/context: ${delegate.attachedFile}`,
+    ].join("\n");
+}
+
+function DelegateChat({
+    delegateTask,
+    onOpen,
+}: {
+    delegateTask: string[];
+    onOpen?: (delegate: DelegatePayload) => void;
+}) {
+    const delegate = getDelegatePayload(delegateTask);
+
+    if (!delegate) {
+        return <ResponseChat content={formatDelegateTask(delegateTask)} />;
+    }
+
+    return (
+        <div className="space-y-3 rounded-lg border border-border/60 bg-muted/35 p-3 text-sm text-foreground">
+            <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                    <div className="text-xs font-medium uppercase text-muted-foreground">Delegation requested</div>
+                    <div className="mt-1 truncate font-medium">{delegate.provider}</div>
+                </div>
+                <button
+                    type="button"
+                    onClick={() => onOpen?.(delegate)}
+                    disabled={!onOpen}
+                    className="flex h-8 shrink-0 items-center gap-2 rounded-lg border border-border bg-background px-2.5 text-xs transition-colors hover:bg-muted disabled:opacity-40"
+                >
+                    <Plus className="size-3.5" />
+                    <span>Review</span>
+                </button>
+            </div>
+            <p className="line-clamp-3 whitespace-pre-wrap leading-relaxed">{delegate.task}</p>
+        </div>
+    );
+}
+
+function formatSingleAssistantResponseContent(response: SingleAssistantResponse) {
     if (response.type === "answer") {
         return response.content;
     }
 
-    return [
-        "Clarifying questions asked:",
-        ...response.questions.map((question, index) => `${index + 1}. ${question}`),
-    ].join("\n");
+    if (response.type === "question") {
+        return [
+            "Clarifying questions asked:",
+            ...response.questions.map((question, index) => `${index + 1}. ${question}`),
+        ].join("\n");
+    }
+
+    if (response.type === "delegate") {
+        return formatDelegateTask(response.delegateTask);
+    }
+
+    return "Response had an unsupported format.";
+}
+
+function formatAssistantResponseContent(response: AssistantResponse) {
+    const responseItems = getAssistantResponseItems(response);
+
+    return responseItems
+        .map((item, index) => {
+            const content = formatSingleAssistantResponseContent(item);
+
+            return responseItems.length > 1 ? `Response ${index + 1}:\n${content}` : content;
+        })
+        .join("\n\n");
+}
+
+function getAssistantHistoryContent(message: Message) {
+    const response = message.response ?? parseAssistantResponse(message.content);
+
+    return formatAssistantResponseContent(response);
+}
+
+function isDelegatedReturnMessage(content: string) {
+    return content.trimStart().startsWith(DELEGATED_RETURN_PREFIX);
 }
 
 export function buildChatHistory(messages: Message[]): ChatHistoryMessage[] {
@@ -172,6 +431,8 @@ export default function ChatArea({
     setMessages,
     pendingContext,
     onPendingContextSent,
+    onDelegateResponse,
+    externalResponding = false,
 }: ChatAreaProps) {
     const [input, setInput] = useState("");
     const [file, setFile] = useState<File | null>(null);
@@ -180,10 +441,11 @@ export default function ChatArea({
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [messageResponding, setMessageResponding] = useState(false);
+    const [expandedDelegatedMessageIds, setExpandedDelegatedMessageIds] = useState<Set<number>>(() => new Set());
 
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [messages, isTyping]);
+    }, [messages, isTyping, externalResponding]);
 
     const autoResize = () => {
         const el = textareaRef.current;
@@ -250,6 +512,8 @@ export default function ChatArea({
             });
             const reply = response.reply || "(empty response)";
             const parsedReply = parseAssistantResponse(reply);
+            const assistantContent = formatAssistantResponseContent(parsedReply);
+            const firstDelegate = getDelegatePayloads(parsedReply)[0];
             onPendingContextSent?.();
 
             setMessages((prev) => [
@@ -257,11 +521,14 @@ export default function ChatArea({
                 {
                     id: Date.now() + 1,
                     role: "assistant",
-                    content: parsedReply.type === "answer" ? parsedReply.content : reply,
+                    content: assistantContent,
                     response: parsedReply,
                     time: now(),
                 },
             ]);
+            if (firstDelegate) {
+                onDelegateResponse?.(firstDelegate);
+            }
         } catch (error) {
             const message = error instanceof Error ? error.message : "Unknown error";
             setMessages((prev) => [
@@ -280,10 +547,10 @@ export default function ChatArea({
     };
 
     const sendMessage = async () => {
+        if (!canSend) return;
+
         const rawText = input;
         const fileName = file?.name;
-
-        if (!rawText.trim() && !fileName) return;
 
         setInput("");
         setFile(null);
@@ -304,8 +571,23 @@ export default function ChatArea({
         }
     };
 
+    const toggleDelegatedMessage = (messageId: number) => {
+        setExpandedDelegatedMessageIds((ids) => {
+            const nextIds = new Set(ids);
+
+            if (nextIds.has(messageId)) {
+                nextIds.delete(messageId);
+            } else {
+                nextIds.add(messageId);
+            }
+
+            return nextIds;
+        });
+    };
+
     // derived boolean — disable sending while a response is being generated
-    const canSend = !messageResponding && (input.trim().length > 0 || !!file)
+    const isResponding = messageResponding || externalResponding;
+    const canSend = !isResponding && (input.trim().length > 0 || !!file);
 
     return (
         <div className="flex flex-1 flex-col overflow-hidden">
@@ -313,20 +595,30 @@ export default function ChatArea({
                 {messages.map((msg) => {
                     if (msg.role === "assistant") {
                         const response = msg.response ?? parseAssistantResponse(msg.content);
+                        const responseItems = getAssistantResponseItems(response);
 
                         return (
                             <div key={msg.id} className="w-full">
                                 <div className="max-w-[76%]">
-                                    <div className="text-[15px] leading-7 text-foreground text-left">
-                                        {response.type === "question" ? (
-                                            <QuestionChat
-                                                questions={response.questions}
-                                                disabled={messageResponding}
-                                                onComplete={sendQuestionAnswers}
-                                            />
-                                        ) : (
-                                            <ResponseChat content={response.content} />
-                                        )}
+                                    <div className="space-y-5 text-left text-[15px] leading-7 text-foreground">
+                                        {responseItems.map((item, index) => (
+                                            <div key={`${msg.id}-response-${index}`}>
+                                                {item.type === "question" ? (
+                                                    <QuestionChat
+                                                        questions={item.questions}
+                                                        disabled={isResponding}
+                                                        onComplete={sendQuestionAnswers}
+                                                    />
+                                                ) : item.type === "answer" ? (
+                                                    <ResponseChat content={item.content} />
+                                                ) : (
+                                                    <DelegateChat
+                                                        delegateTask={item.delegateTask}
+                                                        onOpen={onDelegateResponse}
+                                                    />
+                                                )}
+                                            </div>
+                                        ))}
                                     </div>
                                 </div>
                             </div>
@@ -344,9 +636,33 @@ export default function ChatArea({
                                 )}
 
                                 {msg.content && (
-                                    <div className="whitespace-pre-wrap break-words rounded-[10px] border border-sky-200 bg-sky-100 px-3.5 py-2.5 text-sm leading-relaxed text-sky-950">
-                                        {msg.content}
-                                    </div>
+                                    isDelegatedReturnMessage(msg.content) ? (
+                                        <button
+                                            type="button"
+                                            onClick={() => toggleDelegatedMessage(msg.id)}
+                                            aria-expanded={expandedDelegatedMessageIds.has(msg.id)}
+                                            className="max-w-full rounded-[10px] border border-sky-200 bg-sky-100 px-3.5 py-2.5 text-left text-sm leading-relaxed text-sky-950 transition-colors hover:bg-sky-200/70"
+                                        >
+                                            <span className="flex items-center gap-2 font-medium">
+                                                <span>{DELEGATED_RETURN_LABEL}</span>
+                                                <ChevronDown
+                                                    className={[
+                                                        "size-4 shrink-0 transition-transform",
+                                                        expandedDelegatedMessageIds.has(msg.id) ? "rotate-180" : "",
+                                                    ].join(" ")}
+                                                />
+                                            </span>
+                                            {expandedDelegatedMessageIds.has(msg.id) && (
+                                                <span className="mt-3 block whitespace-pre-wrap break-words border-t border-sky-200 pt-3 font-normal">
+                                                    {msg.content}
+                                                </span>
+                                            )}
+                                        </button>
+                                    ) : (
+                                        <div className="whitespace-pre-wrap break-words rounded-[10px] border border-sky-200 bg-sky-100 px-3.5 py-2.5 text-sm leading-relaxed text-sky-950">
+                                            {msg.content}
+                                        </div>
+                                    )
                                 )}
 
                                 {/* timestamp removed */}
@@ -355,7 +671,7 @@ export default function ChatArea({
                     )
                 })}
 
-                {isTyping && (
+                {(isTyping || externalResponding) && (
                     <div className="flex items-end gap-2.5">
                         <div className="size-7 rounded-full bg-sky-100 text-sky-700 flex items-center justify-center shrink-0">
                             <Bot className="size-3.5" />

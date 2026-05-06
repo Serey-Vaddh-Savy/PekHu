@@ -17,6 +17,7 @@ export const PROVIDER_COLORS: Record<Provider, string> = {
 
 export const PROVIDER_MODELS: Record<Provider, ProviderModel[]> = {
     OpenAI: [
+        { id: "gpt-5-mini", outputPer1M: null },
         { id: "gpt-5.5", outputPer1M: 30.0 },
         { id: "gpt-5.5-pro", outputPer1M: 180.0 },
         { id: "gpt-5.4", outputPer1M: 15.0 },
@@ -35,6 +36,7 @@ export const PROVIDER_MODELS: Record<Provider, ProviderModel[]> = {
     ],
 
     Anthropic: [
+        { id: "claude-haiku-4.5", outputPer1M: 5.0 },
         { id: "claude-opus-4.7", outputPer1M: 25.0 },
         { id: "claude-opus-4.6", outputPer1M: 25.0 },
         { id: "claude-opus-4.5", outputPer1M: 25.0 },
@@ -44,14 +46,13 @@ export const PROVIDER_MODELS: Record<Provider, ProviderModel[]> = {
         { id: "claude-sonnet-4.5", outputPer1M: 15.0 },
         { id: "claude-sonnet-4", outputPer1M: 15.0 },
         { id: "claude-3.7-sonnet", outputPer1M: 15.0 },
-        { id: "claude-haiku-4.5", outputPer1M: 5.0 },
         { id: "claude-3.5-haiku", outputPer1M: 4.0 },
         { id: "claude-3-haiku", outputPer1M: 1.25 },
     ],
 
     Google: [
-        { id: "gemini-3.1-pro", outputPer1M: 12.0 },
         { id: "gemini-3.1-flash", outputPer1M: 1.5 },
+        { id: "gemini-3.1-pro", outputPer1M: 12.0 },
         { id: "gemini-3.1-flash-lite", outputPer1M: 0.75 },
         { id: "gemini-2.5-pro", outputPer1M: 10.0 },
         { id: "gemini-2.5-flash", outputPer1M: 2.5 },
@@ -59,9 +60,9 @@ export const PROVIDER_MODELS: Record<Provider, ProviderModel[]> = {
     ],
 
     DeepSeek: [
+        { id: "deepseek-v4-flash", outputPer1M: 0.28 },
         { id: "deepseek-chat", outputPer1M: 0.28 },
         { id: "deepseek-reasoner", outputPer1M: 2.19 },
-        { id: "deepseek-v4-flash", outputPer1M: 0.28 },
         { id: "deepseek-v4-pro", outputPer1M: 3.48 },
     ],
 

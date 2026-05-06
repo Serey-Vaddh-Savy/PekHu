@@ -1,4 +1,4 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import {
     Bot,
     CheckCircle2,
@@ -15,11 +15,16 @@ import { sendChatMessage } from "../../backend/chatApi";
 import ChatArea, {
     buildChatHistory,
     createInitialMessages,
+    getAssistantResponseItems,
+    getDelegatePayload,
     getSavedKeyForProvider,
     parseAssistantResponse,
+    type DelegatePayload,
     type Message,
 } from "./ChatArea";
 import ApiKey from "./ApiKey";
+import MiniChatDialog from "./MiniChatDialog";
+import DelegateDialog from "./delegateDialog";
 import { API_PROVIDERS, PROVIDER_COLORS, PROVIDER_MODELS, type Provider, type ProviderModel } from "../data/api";
 import { AlertToast } from "../components/ui/alert-toast";
 import {
@@ -48,9 +53,15 @@ type PendingModel = ProviderModel & {
     provider: Provider;
 };
 
+type PendingMiniModel = PendingModel & {
+    miniId: string;
+};
+
 type ChatMini = {
     id: string;
     title: string;
+    provider: Provider;
+    model: string;
     messages: Message[];
     summary?: string;
     summaryAdded?: boolean;
@@ -60,6 +71,17 @@ type ChatMini = {
 type ActiveChat =
     | { type: "master" }
     | { type: "mini"; id: string };
+
+type CreateMiniChatOptions = {
+    title?: string;
+    initialPrompt?: string;
+    sendInitialPrompt?: boolean;
+    delegate?: DelegatePayload;
+};
+
+type DelegateCreatePayload = DelegatePayload & {
+    model?: string;
+};
 
 function resolveMessages(value: SetStateAction<Message[]>, current: Message[]) {
     return typeof value === "function" ? (value as (messages: Message[]) => Message[])(current) : value;
@@ -71,12 +93,23 @@ function hasConversation(messages: Message[]) {
 
 function getSummaryContent(reply: string) {
     const parsedReply = parseAssistantResponse(reply);
+    const responseItems = getAssistantResponseItems(parsedReply);
 
-    if (parsedReply.type === "answer") {
-        return parsedReply.content;
-    }
+    return responseItems
+        .map((response, index) => {
+            let content = "";
 
-    return parsedReply.questions.join("\n");
+            if (response.type === "answer") {
+                content = response.content;
+            } else if (response.type === "question") {
+                content = response.questions.join("\n");
+            } else {
+                content = response.delegateTask.join("\n");
+            }
+
+            return responseItems.length > 1 ? `Response ${index + 1}:\n${content}` : content;
+        })
+        .join("\n\n");
 }
 
 function getMiniTranscript(mini: ChatMini) {
@@ -85,6 +118,82 @@ function getMiniTranscript(mini: ChatMini) {
     return history
         .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.content}`)
         .join("\n\n");
+}
+
+function resolveDelegateProvider(providerName: string, fallback: Provider | null): Provider {
+    const normalized = providerName.trim().toLowerCase();
+    const exactProvider = API_PROVIDERS.find((item) => item.toLowerCase() === normalized);
+
+    if (exactProvider) return exactProvider;
+    if (normalized.includes("openai") || normalized.includes("gpt")) return "OpenAI";
+    if (normalized.includes("anthropic") || normalized.includes("claude")) return "Anthropic";
+    if (normalized.includes("google") || normalized.includes("gemini")) return "Google";
+    if (normalized.includes("deepseek")) return "DeepSeek";
+    if (normalized.includes("minimax") || normalized.includes("mini max")) return "Minimax";
+
+    return fallback ?? "DeepSeek";
+}
+
+function getDefaultModel(providerName: Provider) {
+    return PROVIDER_MODELS[providerName][0]?.id ?? "";
+}
+
+function buildDelegateInitialPrompt(delegate: DelegatePayload) {
+    return [
+        "Delegated task:",
+        "",
+        delegate.task,
+        "",
+        "Attached context:",
+        delegate.attachedFile || "No additional context provided.",
+    ].join("\n");
+}
+
+function buildDelegateTitle(delegate: DelegatePayload) {
+    const compactTask = delegate.task.replace(/\s+/g, " ").trim();
+    const title = compactTask || delegate.provider;
+
+    return `Delegate: ${title.length > 36 ? `${title.slice(0, 36)}...` : title}`;
+}
+
+function buildDelegatedReturnMessage({
+    miniTitle,
+    miniProvider,
+    miniModel,
+    delegate,
+    delegateReply,
+}: {
+    miniTitle: string;
+    miniProvider: Provider;
+    miniModel: string;
+    delegate: DelegatePayload;
+    delegateReply: string;
+}) {
+    return [
+        "Delegated AI response received.",
+        "",
+        `Source: ${miniTitle}`,
+        `Provider: ${miniProvider}`,
+        `Model: ${miniModel}`,
+        "",
+        "Original delegated task:",
+        delegate.task,
+        "",
+        "Delegated response:",
+        getSummaryContent(delegateReply),
+        "",
+        "Use this delegated result to reprocess the original request and produce the next response for the user.",
+    ].join("\n");
+}
+
+function getFirstDelegatePayloadFromResponse(response: ReturnType<typeof parseAssistantResponse>) {
+    for (const item of getAssistantResponseItems(response)) {
+        if (item.type === "delegate") {
+            return getDelegatePayload(item.delegateTask);
+        }
+    }
+
+    return null;
 }
 
 function Chatbot() {
@@ -96,6 +205,10 @@ function Chatbot() {
     const [comboboxOpen, setComboboxOpen] = useState(false);
     const [chatKey, setChatKey] = useState(0);
     const [pendingModel, setPendingModel] = useState<PendingModel | null>(null);
+    const [pendingMiniModel, setPendingMiniModel] = useState<PendingMiniModel | null>(null);
+    const [miniShowModelsFor, setMiniShowModelsFor] = useState<Provider | null>(null);
+    const [miniComboboxOpen, setMiniComboboxOpen] = useState(false);
+    const [miniDialogOpen, setMiniDialogOpen] = useState(false);
     const [chatMaster, setChatMaster] = useState<Message[]>(() => createInitialMessages());
     const [chatMinis, setChatMinis] = useState<ChatMini[]>([]);
     const [activeChat, setActiveChat] = useState<ActiveChat>({ type: "master" });
@@ -103,12 +216,33 @@ function Chatbot() {
     const [selectedMiniContextIds, setSelectedMiniContextIds] = useState<string[]>([]);
     const [pendingMasterContext, setPendingMasterContext] = useState("");
     const [pendingMasterContextTitles, setPendingMasterContextTitles] = useState<string[]>([]);
+    const [delegateDialogOpen, setDelegateDialogOpen] = useState(false);
+    const [activeDelegate, setActiveDelegate] = useState<DelegatePayload | null>(null);
+    const [masterAutoResponding, setMasterAutoResponding] = useState(false);
+    const chatMasterRef = useRef(chatMaster);
+    const masterProviderRef = useRef(provider);
+    const masterModelRef = useRef(model);
+    const chatGenerationRef = useRef(0);
+
+    useEffect(() => {
+        chatMasterRef.current = chatMaster;
+    }, [chatMaster]);
+
+    useEffect(() => {
+        masterProviderRef.current = provider;
+    }, [provider]);
+
+    useEffect(() => {
+        masterModelRef.current = model;
+    }, [model]);
 
     const activeMini = activeChat.type === "mini"
         ? chatMinis.find((mini) => mini.id === activeChat.id)
         : undefined;
     const activeMessages = activeChat.type === "master" ? chatMaster : activeMini?.messages ?? createInitialMessages();
     const activeTitle = activeChat.type === "master" ? "Master Context" : activeMini?.title ?? "Mini chat";
+    const activeProvider = activeChat.type === "mini" ? activeMini?.provider ?? provider : provider;
+    const activeModel = activeChat.type === "mini" ? activeMini?.model ?? model : model;
     const miniSummaries = chatMinis.filter((mini) => mini.summary);
     const minisWithContext = chatMinis.filter((mini) => hasConversation(mini.messages));
 
@@ -128,12 +262,25 @@ function Chatbot() {
         );
     };
 
+    const setMasterMessages: Dispatch<SetStateAction<Message[]>> = (value) => {
+        setChatMaster((current) => {
+            const nextMessages = resolveMessages(value, current);
+            chatMasterRef.current = nextMessages;
+
+            return nextMessages;
+        });
+    };
+
     const setActiveMessages: Dispatch<SetStateAction<Message[]>> =
-        activeChat.type === "master" ? setChatMaster : setActiveMiniMessages;
+        activeChat.type === "master" ? setMasterMessages : setActiveMiniMessages;
 
     const handleNewChat = () => {
+        const initialMessages = createInitialMessages();
+
+        chatGenerationRef.current += 1;
         setChatKey((k) => k + 1);
-        setChatMaster(createInitialMessages());
+        chatMasterRef.current = initialMessages;
+        setChatMaster(initialMessages);
         setChatMinis([]);
         setActiveChat({ type: "master" });
         setContextPickerOpen(false);
@@ -145,6 +292,13 @@ function Chatbot() {
         setShowModelsFor(null);
         setComboboxOpen(false);
         setPendingModel(null);
+        setPendingMiniModel(null);
+        setMiniShowModelsFor(null);
+        setMiniComboboxOpen(false);
+        setMiniDialogOpen(false);
+        setDelegateDialogOpen(false);
+        setActiveDelegate(null);
+        setMasterAutoResponding(false);
     };
 
     const clearModel = () => {
@@ -154,20 +308,256 @@ function Chatbot() {
         setPendingModel(null);
     };
 
-    const handleCreateMiniChat = () => {
-        const id = `mini-${Date.now()}`;
-        const title = `Mini chat ${chatMinis.length + 1}`;
+    const openMiniChatDialog = () => {
+        setMiniDialogOpen(true);
+    };
+
+    const appendMasterMessages = (newMessages: Message[]) => {
+        const nextMessages = [...chatMasterRef.current, ...newMessages];
+
+        chatMasterRef.current = nextMessages;
+        setChatMaster(nextMessages);
+
+        return nextMessages;
+    };
+
+    const sendDelegatedReplyToMaster = async ({
+        miniTitle,
+        miniProvider,
+        miniModel,
+        delegate,
+        delegateReply,
+        chatGeneration,
+    }: {
+        miniTitle: string;
+        miniProvider: Provider;
+        miniModel: string;
+        delegate: DelegatePayload;
+        delegateReply: string;
+        chatGeneration: number;
+    }) => {
+        if (chatGeneration !== chatGenerationRef.current) return;
+
+        const selectedProvider = masterProviderRef.current ?? "DeepSeek";
+        const selectedModel = masterModelRef.current ?? undefined;
+        const returnedDelegateMessage = buildDelegatedReturnMessage({
+            miniTitle,
+            miniProvider,
+            miniModel,
+            delegate,
+            delegateReply,
+        });
+        const userMessage: Message = {
+            id: Date.now(),
+            role: "user",
+            content: returnedDelegateMessage,
+            time: now(),
+        };
+        const historyMessages = appendMasterMessages([userMessage]);
+
+        setActiveChat({ type: "master" });
+        setContextPickerOpen(false);
+        setMasterAutoResponding(true);
+
+        try {
+            const apiKey = getSavedKeyForProvider(selectedProvider);
+            const response = await sendChatMessage({
+                message: returnedDelegateMessage,
+                history: buildChatHistory(historyMessages),
+                model: selectedModel,
+                provider: selectedProvider,
+                apiKey: apiKey ?? undefined,
+            });
+            const reply = response.reply || "(empty response)";
+            if (chatGeneration !== chatGenerationRef.current) return;
+
+            const parsedReply = parseAssistantResponse(reply);
+            const assistantContent = getSummaryContent(reply);
+            const firstDelegate = getFirstDelegatePayloadFromResponse(parsedReply);
+
+            appendMasterMessages([
+                {
+                    id: Date.now() + 1,
+                    role: "assistant",
+                    content: assistantContent,
+                    response: parsedReply,
+                    time: now(),
+                },
+            ]);
+            if (firstDelegate) {
+                openDelegateDialog(firstDelegate);
+            }
+        } catch (error) {
+            if (chatGeneration !== chatGenerationRef.current) return;
+
+            const message = error instanceof Error ? error.message : "Unknown error";
+
+            appendMasterMessages([
+                {
+                    id: Date.now() + 1,
+                    role: "assistant",
+                    content: `Request failed while reprocessing delegated response: ${message}`,
+                    time: now(),
+                },
+            ]);
+        } finally {
+            if (chatGeneration === chatGenerationRef.current) {
+                setMasterAutoResponding(false);
+            }
+        }
+    };
+
+    const handleCreateMiniChat = (miniProvider: Provider, miniModel: string, options?: CreateMiniChatOptions) => {
+        const createdAt = Date.now();
+        const id = `mini-${createdAt}`;
+        const title = options?.title ?? `Mini chat ${chatMinis.length + 1}`;
+        const initialPrompt = options?.initialPrompt?.trim();
+        const messages = createInitialMessages();
+
+        if (initialPrompt) {
+            messages.push({
+                id: createdAt + 1,
+                role: "user",
+                content: initialPrompt,
+                time: now(),
+            });
+        }
 
         setChatMinis((minis) => [
             ...minis,
             {
                 id,
                 title,
-                messages: createInitialMessages(),
+                provider: miniProvider,
+                model: miniModel,
+                messages,
             },
         ]);
         setContextPickerOpen(false);
         setActiveChat({ type: "mini", id });
+        setMiniDialogOpen(false);
+
+        if (options?.sendInitialPrompt && initialPrompt) {
+            void sendInitialMiniPrompt(
+                id,
+                title,
+                miniProvider,
+                miniModel,
+                initialPrompt,
+                messages,
+                chatGenerationRef.current,
+                options.delegate,
+            );
+        }
+    };
+
+    const sendInitialMiniPrompt = async (
+        miniId: string,
+        miniTitle: string,
+        miniProvider: Provider,
+        miniModel: string,
+        initialPrompt: string,
+        messages: Message[],
+        chatGeneration: number,
+        delegate?: DelegatePayload,
+    ) => {
+        try {
+            const apiKey = getSavedKeyForProvider(miniProvider);
+            const response = await sendChatMessage({
+                message: initialPrompt,
+                history: buildChatHistory(messages),
+                model: miniModel,
+                provider: miniProvider,
+                apiKey: apiKey ?? undefined,
+            });
+            const reply = response.reply || "(empty response)";
+            if (chatGeneration !== chatGenerationRef.current) return;
+
+            setChatMinis((minis) =>
+                minis.map((mini) =>
+                    mini.id === miniId
+                        ? {
+                            ...mini,
+                            messages: [
+                                ...mini.messages,
+                                {
+                                    id: Date.now(),
+                                    role: "assistant",
+                                    content: reply,
+                                    response: parseAssistantResponse(reply),
+                                    time: now(),
+                                },
+                            ],
+                        }
+                        : mini,
+                ),
+            );
+            if (delegate) {
+                await sendDelegatedReplyToMaster({
+                    miniTitle,
+                    miniProvider,
+                    miniModel,
+                    delegate,
+                    delegateReply: reply,
+                    chatGeneration,
+                });
+            }
+        } catch (error) {
+            if (chatGeneration !== chatGenerationRef.current) return;
+
+            const message = error instanceof Error ? error.message : "Unknown error";
+
+            setChatMinis((minis) =>
+                minis.map((mini) =>
+                    mini.id === miniId
+                        ? {
+                            ...mini,
+                            messages: [
+                                ...mini.messages,
+                                {
+                                    id: Date.now(),
+                                    role: "assistant",
+                                    content: `Request failed: ${message}`,
+                                    time: now(),
+                                },
+                            ],
+                        }
+                        : mini,
+                ),
+            );
+        }
+    };
+
+    const openDelegateDialog = (delegate: DelegatePayload) => {
+        setActiveDelegate(delegate);
+        setDelegateDialogOpen(true);
+    };
+
+    const handleDelegateDialogOpenChange = (open: boolean) => {
+        setDelegateDialogOpen(open);
+        if (!open) {
+            setActiveDelegate(null);
+        }
+    };
+
+    const createMiniChatFromDelegate = (delegateOverride?: DelegateCreatePayload) => {
+        const delegate: DelegateCreatePayload | null = delegateOverride ?? activeDelegate;
+        if (!delegate) return;
+
+        const miniProvider = resolveDelegateProvider(delegate.provider, activeProvider);
+        const miniModel =
+            delegate.model && PROVIDER_MODELS[miniProvider].some((providerModel) => providerModel.id === delegate.model)
+                ? delegate.model
+                : getDefaultModel(miniProvider);
+        if (!miniModel) return;
+
+        handleCreateMiniChat(miniProvider, miniModel, {
+            title: buildDelegateTitle(delegate),
+            initialPrompt: buildDelegateInitialPrompt(delegate),
+            sendInitialPrompt: true,
+            delegate,
+        });
+        handleDelegateDialogOpenChange(false);
     };
 
     const deleteMiniChat = (miniId: string) => {
@@ -189,12 +579,12 @@ function Chatbot() {
         );
 
         try {
-            const selectedProvider = provider ?? "DeepSeek";
+            const selectedProvider = mini.provider;
             const apiKey = getSavedKeyForProvider(selectedProvider);
             const response = await sendChatMessage({
                 message: "Summarize this mini chat for adding into the main chat context. Return concise plain text only.",
                 history: buildChatHistory(mini.messages),
-                model: model ?? undefined,
+                model: mini.model,
                 provider: selectedProvider,
                 apiKey: apiKey ?? undefined,
             });
@@ -317,6 +707,45 @@ function Chatbot() {
         setPendingModel(null);
     };
 
+    const onChangeMiniModel = (selectedProvider: Provider, selectedModel: ProviderModel) => {
+        if (!activeMini) return;
+
+        if (activeMini.provider === selectedProvider && activeMini.model === selectedModel.id) {
+            setMiniShowModelsFor(null);
+            setMiniComboboxOpen(false);
+            return;
+        }
+
+        setPendingMiniModel({
+            miniId: activeMini.id,
+            provider: selectedProvider,
+            ...selectedModel,
+        });
+        setMiniShowModelsFor(null);
+        setMiniComboboxOpen(false);
+    };
+
+    const confirmPendingMiniModel = () => {
+        if (!pendingMiniModel) return;
+
+        setChatMinis((minis) =>
+            minis.map((mini) =>
+                mini.id === pendingMiniModel.miniId
+                    ? {
+                        ...mini,
+                        provider: pendingMiniModel.provider,
+                        model: pendingMiniModel.id,
+                    }
+                    : mini,
+            ),
+        );
+        setPendingMiniModel(null);
+    };
+
+    const cancelPendingMiniModel = () => {
+        setPendingMiniModel(null);
+    };
+
     const selectedModelPrice =
         provider && model
             ? PROVIDER_MODELS[provider].find((providerModel) => providerModel.id === model)?.outputPer1M ?? null
@@ -326,6 +755,11 @@ function Chatbot() {
         provider && model
             ? `${model} - ${formatSelectedOutputPrice(selectedModelPrice)}`
             : "";
+
+    const activeModelPrice =
+        activeProvider && activeModel
+            ? PROVIDER_MODELS[activeProvider].find((providerModel) => providerModel.id === activeModel)?.outputPer1M ?? null
+            : null;
 
     const modelChangeAlertToast = () => (
         <AlertToast
@@ -340,6 +774,22 @@ function Chatbot() {
             cancelLabel="Cancel"
             onConfirm={confirmPendingModel}
             onCancel={cancelPendingModel}
+        />
+    );
+
+    const miniModelChangeAlertToast = () => (
+        <AlertToast
+            open={pendingMiniModel != null}
+            title="Change to this model?"
+            description={
+                pendingMiniModel
+                    ? `${pendingMiniModel.id} - ${formatOutputPrice(pendingMiniModel.outputPer1M)}. \n All chat in this mini chat will be re-process, it will cost extra.`
+                    : undefined
+            }
+            confirmLabel="Change Model"
+            cancelLabel="Cancel"
+            onConfirm={confirmPendingMiniModel}
+            onCancel={cancelPendingMiniModel}
         />
     );
 
@@ -398,6 +848,77 @@ function Chatbot() {
                                         type="button"
                                         className="flex h-14 w-full flex-col items-start justify-center gap-0.5 rounded-md px-3 py-2 text-left text-sm hover:bg-accent"
                                         onClick={() => onChangeModel(showModelsFor, m)}
+                                    >
+                                        <span className="w-full truncate font-medium">{m.id}</span>
+                                        <span className="w-full truncate text-xs text-muted-foreground">
+                                            {formatOutputPrice(m.outputPer1M)}
+                                        </span>
+                                    </button>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
+            </ComboboxContent>
+        </Combobox>
+    );
+
+    const miniModelCombobox = (className = "w-56") => (
+        <Combobox
+            open={miniComboboxOpen}
+            onOpenChange={setMiniComboboxOpen}
+        >
+            <ComboboxInput
+                placeholder={activeModel ? `${activeProvider} - ${activeModel}` : "Select model"}
+                value={
+                    activeModel
+                        ? `${activeModel} - ${formatSelectedOutputPrice(activeModelPrice)}`
+                        : ""
+                }
+                readOnly
+                showTrigger
+                showClear={false}
+                className={className}
+            />
+
+            <ComboboxContent side="bottom" align="end">
+                {miniShowModelsFor == null ? (
+                    <ComboboxList>
+                        {API_PROVIDERS.map((p) => (
+                            <li key={p} className="list-none">
+                                <button
+                                    type="button"
+                                    className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent rounded"
+                                    onClick={() => {
+                                        setMiniShowModelsFor(p);
+                                        setMiniComboboxOpen(true);
+                                    }}
+                                >
+                                    <span className={["inline-block w-2 h-2 rounded-full", PROVIDER_COLORS[p]].join(" ")}></span>
+                                    <span className="truncate">{p}</span>
+                                </button>
+                            </li>
+                        ))}
+                    </ComboboxList>
+                ) : (
+                    <div>
+                        <div className="flex items-center justify-between px-3 py-2 border-b">
+                            <button
+                                type="button"
+                                className="text-sm text-muted-foreground"
+                                onClick={() => setMiniShowModelsFor(null)}
+                            >
+                                Back
+                            </button>
+                            <div className="text-sm font-medium">{miniShowModelsFor}</div>
+                        </div>
+                        <ul className="max-h-[12.25rem] overflow-y-auto overscroll-contain p-1">
+                            {PROVIDER_MODELS[miniShowModelsFor].map((m) => (
+                                <li key={m.id} className="list-none">
+                                    <button
+                                        type="button"
+                                        className="flex h-14 w-full flex-col items-start justify-center gap-0.5 rounded-md px-3 py-2 text-left text-sm hover:bg-accent"
+                                        onClick={() => onChangeMiniModel(miniShowModelsFor, m)}
                                     >
                                         <span className="w-full truncate font-medium">{m.id}</span>
                                         <span className="w-full truncate text-xs text-muted-foreground">
@@ -483,7 +1004,7 @@ function Chatbot() {
         </div>
     );
 
-    const headerActions = activePage === "chatbot" && model && (
+    const headerActions = activePage === "chatbot" && activeModel && (
         <div className="ml-auto flex items-center gap-2">
             {activeChat.type === "master" ? (
                 <>
@@ -494,15 +1015,15 @@ function Chatbot() {
                         className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-3 text-sm transition-colors hover:bg-muted disabled:opacity-40"
                     >
                         <FileText className="size-4" />
-                        <span className="hidden sm:inline">Add context</span>
+                        <span className="hidden sm:inline">Context</span>
                     </button>
                     <button
                         type="button"
-                        onClick={handleCreateMiniChat}
+                        onClick={openMiniChatDialog}
                         className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-3 text-sm transition-colors hover:bg-muted"
                     >
                         <Plus className="size-4" />
-                        <span className="hidden sm:inline">Mini chat</span>
+                        <span className="hidden sm:inline">Mini</span>
                     </button>
                 </>
             ) : (
@@ -529,7 +1050,11 @@ function Chatbot() {
                     </button>
                 </>
             )}
-            {modelCombobox()}
+            {activeChat.type === "master" ? (
+                modelCombobox()
+            ) : (
+                miniModelCombobox()
+            )}
         </div>
     );
 
@@ -590,7 +1115,7 @@ function Chatbot() {
             </aside>
 
             <div className="flex flex-1 flex-col overflow-hidden">
-                <header className="flex h-14 items-center gap-3 border-b border-border/60 bg-background/80 px-4 backdrop-blur shrink-0">
+                <header className="flex h-[69px] items-center gap-3 border-b border-border/60 bg-background/80 px-4 backdrop-blur shrink-0">
                     <button
                         onClick={() => setSidebarOpen((o) => !o)}
                         className="flex size-8 items-center justify-center rounded-lg border border-border hover:bg-muted transition-colors"
@@ -722,15 +1247,17 @@ function Chatbot() {
                 )}
 
                 {activePage === "chatbot" && (
-                    model ? (
+                    activeModel ? (
                         <ChatArea
                             key={`${chatKey}-${activeChat.type}-${activeChat.type === "mini" ? activeChat.id : "master"}`}
-                            provider={provider}
-                            model={model}
+                            provider={activeProvider}
+                            model={activeModel}
                             messages={activeMessages}
                             setMessages={setActiveMessages}
                             pendingContext={activeChat.type === "master" ? pendingMasterContext : undefined}
                             onPendingContextSent={activeChat.type === "master" ? clearPendingMasterContext : undefined}
+                            onDelegateResponse={openDelegateDialog}
+                            externalResponding={activeChat.type === "master" ? masterAutoResponding : false}
                         />
                     ) : (
                         <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4">
@@ -748,6 +1275,22 @@ function Chatbot() {
             </div>
 
             {modelChangeAlertToast()}
+            {miniModelChangeAlertToast()}
+            <MiniChatDialog
+                open={miniDialogOpen}
+                defaultProvider={provider ?? "DeepSeek"}
+                onOpenChange={setMiniDialogOpen}
+                onCreate={handleCreateMiniChat}
+            />
+            <DelegateDialog
+                open={delegateDialogOpen}
+                provider={activeDelegate?.provider ?? ""}
+                model={activeDelegate ? getDefaultModel(resolveDelegateProvider(activeDelegate.provider, activeProvider)) : undefined}
+                task={activeDelegate?.task ?? ""}
+                attachedFile={activeDelegate?.attachedFile ?? "No additional context provided."}
+                onOpenChange={handleDelegateDialogOpenChange}
+                onCreate={activeDelegate ? createMiniChatFromDelegate : undefined}
+            />
         </div>
     );
 }

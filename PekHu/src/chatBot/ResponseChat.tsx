@@ -9,6 +9,9 @@ const unorderedListPattern = /^\s*[-*+]\s+(.+)$/;
 const orderedListPattern = /^\s*\d+[.)]\s+(.+)$/;
 const headingPattern = /^(#{1,3})\s+(.+)$/;
 const codeFenceStartPattern = /^```([a-zA-Z0-9_-]+)?\s*$/;
+const tableSeparatorCellPattern = /^:?-{3,}:?$/;
+
+type TableAlignment = "left" | "center" | "right";
 
 function normalizeContent(content: string) {
     return content
@@ -68,6 +71,61 @@ function getListItem(line: string) {
     return line.match(unorderedListPattern)?.[1] ?? line.match(orderedListPattern)?.[1] ?? null;
 }
 
+function splitTableRow(line: string) {
+    const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+    const cells: string[] = [];
+    let cell = "";
+    let escaped = false;
+
+    for (const char of trimmed) {
+        if (escaped) {
+            cell += char;
+            escaped = false;
+            continue;
+        }
+
+        if (char === "\\") {
+            escaped = true;
+            continue;
+        }
+
+        if (char === "|") {
+            cells.push(cell.trim());
+            cell = "";
+            continue;
+        }
+
+        cell += char;
+    }
+
+    cells.push(cell.trim());
+
+    return cells;
+}
+
+function isPotentialTableRow(line: string) {
+    return line.includes("|") && splitTableRow(line).length >= 2;
+}
+
+function isTableSeparatorRow(line: string) {
+    const cells = splitTableRow(line);
+
+    return cells.length >= 2 && cells.every((cell) => tableSeparatorCellPattern.test(cell.replace(/\s+/g, "")));
+}
+
+function getTableAlignments(separatorLine: string): TableAlignment[] {
+    return splitTableRow(separatorLine).map((cell) => {
+        const compact = cell.replace(/\s+/g, "");
+        const startsWithColon = compact.startsWith(":");
+        const endsWithColon = compact.endsWith(":");
+
+        if (startsWithColon && endsWithColon) return "center";
+        if (endsWithColon) return "right";
+
+        return "left";
+    });
+}
+
 function isCodeFenceStart(line: string) {
     return Boolean(line.trim().match(codeFenceStartPattern));
 }
@@ -113,6 +171,60 @@ function renderParagraph(lines: string[], key: string) {
                 </span>
             ))}
         </p>
+    );
+}
+
+function renderTable(header: string[], alignments: TableAlignment[], rows: string[][], key: string) {
+    const columnCount = header.length;
+    const getAlignmentClass = (columnIndex: number) => {
+        const alignment = alignments[columnIndex] ?? "left";
+
+        if (alignment === "center") return "text-center";
+        if (alignment === "right") return "text-right";
+
+        return "text-left";
+    };
+    const normalizeCells = (cells: string[]) =>
+        Array.from({ length: columnCount }, (_, columnIndex) => cells[columnIndex] ?? "");
+
+    return (
+        <div key={key} className="overflow-x-auto rounded-lg border border-border/70">
+            <table className="min-w-full border-collapse text-sm leading-6">
+                <thead className="bg-muted/70">
+                    <tr>
+                        {normalizeCells(header).map((cell, columnIndex) => (
+                            <th
+                                key={`${key}-head-${columnIndex}`}
+                                scope="col"
+                                className={[
+                                    "border-b border-border/70 px-3 py-2 font-semibold text-foreground",
+                                    getAlignmentClass(columnIndex),
+                                ].join(" ")}
+                            >
+                                {renderInline(cell, `${key}-head-${columnIndex}`)}
+                            </th>
+                        ))}
+                    </tr>
+                </thead>
+                <tbody className="divide-y divide-border/60 bg-background">
+                    {rows.map((row, rowIndex) => (
+                        <tr key={`${key}-row-${rowIndex}`} className="align-top">
+                            {normalizeCells(row).map((cell, columnIndex) => (
+                                <td
+                                    key={`${key}-row-${rowIndex}-cell-${columnIndex}`}
+                                    className={[
+                                        "px-3 py-2 text-foreground",
+                                        getAlignmentClass(columnIndex),
+                                    ].join(" ")}
+                                >
+                                    {renderInline(cell, `${key}-row-${rowIndex}-cell-${columnIndex}`)}
+                                </td>
+                            ))}
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </div>
     );
 }
 
@@ -165,6 +277,25 @@ export default function ResponseChat({ content }: ResponseChatProps) {
             continue;
         }
 
+        if (
+            index + 1 < lines.length &&
+            isPotentialTableRow(trimmed) &&
+            isTableSeparatorRow(lines[index + 1])
+        ) {
+            const header = splitTableRow(trimmed);
+            const alignments = getTableAlignments(lines[index + 1]);
+            const rows: string[][] = [];
+
+            index += 2;
+            while (index < lines.length && isPotentialTableRow(lines[index]) && lines[index].trim()) {
+                rows.push(splitTableRow(lines[index]));
+                index += 1;
+            }
+
+            blocks.push(renderTable(header, alignments, rows, `table-${index}`));
+            continue;
+        }
+
         const unorderedItem = trimmed.match(unorderedListPattern);
         const orderedItem = trimmed.match(orderedListPattern);
         if (unorderedItem || orderedItem) {
@@ -206,6 +337,11 @@ export default function ResponseChat({ content }: ResponseChatProps) {
                 !paragraphLine ||
                 paragraphLine.match(headingPattern) ||
                 getListItem(paragraphLine) ||
+                (
+                    index + 1 < lines.length &&
+                    isPotentialTableRow(paragraphLine) &&
+                    isTableSeparatorRow(lines[index + 1])
+                ) ||
                 isCodeFenceStart(paragraphLine)
             ) {
                 break;
