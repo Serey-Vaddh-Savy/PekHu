@@ -51,9 +51,9 @@ export const PROVIDER_MODELS: Record<Provider, ProviderModel[]> = {
     ],
 
     Google: [
+        { id: "gemini-3.1-flash-lite", outputPer1M: 0.75 },
         { id: "gemini-3.1-flash", outputPer1M: 1.5 },
         { id: "gemini-3.1-pro", outputPer1M: 12.0 },
-        { id: "gemini-3.1-flash-lite", outputPer1M: 0.75 },
         { id: "gemini-2.5-pro", outputPer1M: 10.0 },
         { id: "gemini-2.5-flash", outputPer1M: 2.5 },
         { id: "gemini-2.5-flash-lite", outputPer1M: 0.4 },

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, KeyboardEvent, ChangeEvent, type Dispatch, type SetStateAction } from "react";
-import { Send, Paperclip, Smile, Mic, X, Bot, File, Plus, ChevronDown } from "lucide-react";
-import { sendChatMessage, type ChatHistoryMessage } from "../../backend/chatApi";
+import { Send, Paperclip, Smile, Mic, X, Bot, File, Plus } from "lucide-react";
+import { sendChatMessage, sendDelegateTaskMessage, type ChatHistoryMessage } from "../../backend/chatApi";
 import { type Provider } from "../data/api";
 import ResponseChat from "./ResponseChat";
 import QuestionChat, { type QuestionAnswer } from "./QuestionChat";
@@ -33,8 +33,6 @@ const now = () =>
     new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
 const CHAT_TEXTAREA_MAX_HEIGHT = 250;
-const DELEGATED_RETURN_PREFIX = "Delegated AI response received.";
-const DELEGATED_RETURN_LABEL = "Delegated response received";
 
 export const INITIAL_MESSAGES: Message[] = [
     {
@@ -55,6 +53,7 @@ interface ChatAreaProps {
     onPendingContextSent?: () => void;
     onDelegateResponse?: (delegate: DelegatePayload) => void;
     externalResponding?: boolean;
+    useDelegateTaskApi?: boolean;
 }
 
 export function createInitialMessages() {
@@ -411,10 +410,6 @@ function getAssistantHistoryContent(message: Message) {
     return formatAssistantResponseContent(response);
 }
 
-function isDelegatedReturnMessage(content: string) {
-    return content.trimStart().startsWith(DELEGATED_RETURN_PREFIX);
-}
-
 export function buildChatHistory(messages: Message[]): ChatHistoryMessage[] {
     return messages
         .filter((message) => message.content.trim() || message.role === "assistant")
@@ -433,6 +428,7 @@ export default function ChatArea({
     onPendingContextSent,
     onDelegateResponse,
     externalResponding = false,
+    useDelegateTaskApi = false,
 }: ChatAreaProps) {
     const [input, setInput] = useState("");
     const [file, setFile] = useState<File | null>(null);
@@ -441,7 +437,6 @@ export default function ChatArea({
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [messageResponding, setMessageResponding] = useState(false);
-    const [expandedDelegatedMessageIds, setExpandedDelegatedMessageIds] = useState<Set<number>>(() => new Set());
 
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -503,7 +498,8 @@ export default function ChatArea({
             const historyMessages = hiddenContextMessage
                 ? [...messages, hiddenContextMessage, userMsg]
                 : nextMessages;
-            const response = await sendChatMessage({
+            const sendMessageRequest = useDelegateTaskApi ? sendDelegateTaskMessage : sendChatMessage;
+            const response = await sendMessageRequest({
                 message: rawText,
                 history: buildChatHistory(historyMessages),
                 model: model ?? undefined,
@@ -571,20 +567,6 @@ export default function ChatArea({
         }
     };
 
-    const toggleDelegatedMessage = (messageId: number) => {
-        setExpandedDelegatedMessageIds((ids) => {
-            const nextIds = new Set(ids);
-
-            if (nextIds.has(messageId)) {
-                nextIds.delete(messageId);
-            } else {
-                nextIds.add(messageId);
-            }
-
-            return nextIds;
-        });
-    };
-
     // derived boolean — disable sending while a response is being generated
     const isResponding = messageResponding || externalResponding;
     const canSend = !isResponding && (input.trim().length > 0 || !!file);
@@ -636,33 +618,9 @@ export default function ChatArea({
                                 )}
 
                                 {msg.content && (
-                                    isDelegatedReturnMessage(msg.content) ? (
-                                        <button
-                                            type="button"
-                                            onClick={() => toggleDelegatedMessage(msg.id)}
-                                            aria-expanded={expandedDelegatedMessageIds.has(msg.id)}
-                                            className="max-w-full rounded-[10px] border border-sky-200 bg-sky-100 px-3.5 py-2.5 text-left text-sm leading-relaxed text-sky-950 transition-colors hover:bg-sky-200/70"
-                                        >
-                                            <span className="flex items-center gap-2 font-medium">
-                                                <span>{DELEGATED_RETURN_LABEL}</span>
-                                                <ChevronDown
-                                                    className={[
-                                                        "size-4 shrink-0 transition-transform",
-                                                        expandedDelegatedMessageIds.has(msg.id) ? "rotate-180" : "",
-                                                    ].join(" ")}
-                                                />
-                                            </span>
-                                            {expandedDelegatedMessageIds.has(msg.id) && (
-                                                <span className="mt-3 block whitespace-pre-wrap break-words border-t border-sky-200 pt-3 font-normal">
-                                                    {msg.content}
-                                                </span>
-                                            )}
-                                        </button>
-                                    ) : (
-                                        <div className="whitespace-pre-wrap break-words rounded-[10px] border border-sky-200 bg-sky-100 px-3.5 py-2.5 text-sm leading-relaxed text-sky-950">
-                                            {msg.content}
-                                        </div>
-                                    )
+                                    <div className="whitespace-pre-wrap break-words rounded-[10px] border border-sky-200 bg-sky-100 px-3.5 py-2.5 text-sm leading-relaxed text-sky-950">
+                                        {msg.content}
+                                    </div>
                                 )}
 
                                 {/* timestamp removed */}

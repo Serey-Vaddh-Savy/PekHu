@@ -21,7 +21,22 @@ const API_BASE_URL = "http://localhost:8000";
 
 
 export async function sendChatMessage(payload: ChatRequest): Promise<ChatResponse> {
-  const response = await fetch(`${API_BASE_URL}/DeepSeek/test`, {
+  const response = await fetch(`${API_BASE_URL}/HeadMaster/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Chat request failed (${response.status}): ${text}`);
+  }
+
+  return response.json() as Promise<ChatResponse>;
+}
+
+export async function sendDelegateTaskMessage(payload: ChatRequest): Promise<ChatResponse> {
+  const response = await fetch(`${API_BASE_URL}/DelegateTask/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),

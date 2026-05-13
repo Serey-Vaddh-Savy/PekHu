@@ -11,12 +11,11 @@ import {
     Sparkles,
     Trash2,
 } from "lucide-react";
-import { sendChatMessage } from "../../backend/chatApi";
+import { sendDelegateTaskMessage } from "../../backend/chatApi";
 import ChatArea, {
     buildChatHistory,
     createInitialMessages,
     getAssistantResponseItems,
-    getDelegatePayload,
     getSavedKeyForProvider,
     parseAssistantResponse,
     type DelegatePayload,
@@ -156,46 +155,6 @@ function buildDelegateTitle(delegate: DelegatePayload) {
     return `Delegate: ${title.length > 36 ? `${title.slice(0, 36)}...` : title}`;
 }
 
-function buildDelegatedReturnMessage({
-    miniTitle,
-    miniProvider,
-    miniModel,
-    delegate,
-    delegateReply,
-}: {
-    miniTitle: string;
-    miniProvider: Provider;
-    miniModel: string;
-    delegate: DelegatePayload;
-    delegateReply: string;
-}) {
-    return [
-        "Delegated AI response received.",
-        "",
-        `Source: ${miniTitle}`,
-        `Provider: ${miniProvider}`,
-        `Model: ${miniModel}`,
-        "",
-        "Original delegated task:",
-        delegate.task,
-        "",
-        "Delegated response:",
-        getSummaryContent(delegateReply),
-        "",
-        "Use this delegated result to reprocess the original request and produce the next response for the user.",
-    ].join("\n");
-}
-
-function getFirstDelegatePayloadFromResponse(response: ReturnType<typeof parseAssistantResponse>) {
-    for (const item of getAssistantResponseItems(response)) {
-        if (item.type === "delegate") {
-            return getDelegatePayload(item.delegateTask);
-        }
-    }
-
-    return null;
-}
-
 function Chatbot() {
     const [sidebarOpen, setSidebarOpen] = useState(true);
     const [activePage, setActivePage] = useState("chatbot");
@@ -218,23 +177,12 @@ function Chatbot() {
     const [pendingMasterContextTitles, setPendingMasterContextTitles] = useState<string[]>([]);
     const [delegateDialogOpen, setDelegateDialogOpen] = useState(false);
     const [activeDelegate, setActiveDelegate] = useState<DelegatePayload | null>(null);
-    const [masterAutoResponding, setMasterAutoResponding] = useState(false);
     const chatMasterRef = useRef(chatMaster);
-    const masterProviderRef = useRef(provider);
-    const masterModelRef = useRef(model);
     const chatGenerationRef = useRef(0);
 
     useEffect(() => {
         chatMasterRef.current = chatMaster;
     }, [chatMaster]);
-
-    useEffect(() => {
-        masterProviderRef.current = provider;
-    }, [provider]);
-
-    useEffect(() => {
-        masterModelRef.current = model;
-    }, [model]);
 
     const activeMini = activeChat.type === "mini"
         ? chatMinis.find((mini) => mini.id === activeChat.id)
@@ -298,7 +246,6 @@ function Chatbot() {
         setMiniDialogOpen(false);
         setDelegateDialogOpen(false);
         setActiveDelegate(null);
-        setMasterAutoResponding(false);
     };
 
     const clearModel = () => {
@@ -321,90 +268,27 @@ function Chatbot() {
         return nextMessages;
     };
 
-    const sendDelegatedReplyToMaster = async ({
-        miniTitle,
-        miniProvider,
-        miniModel,
-        delegate,
+    const addDelegatedReplyToMaster = ({
         delegateReply,
         chatGeneration,
     }: {
-        miniTitle: string;
-        miniProvider: Provider;
-        miniModel: string;
-        delegate: DelegatePayload;
         delegateReply: string;
         chatGeneration: number;
     }) => {
         if (chatGeneration !== chatGenerationRef.current) return;
 
-        const selectedProvider = masterProviderRef.current ?? "DeepSeek";
-        const selectedModel = masterModelRef.current ?? undefined;
-        const returnedDelegateMessage = buildDelegatedReturnMessage({
-            miniTitle,
-            miniProvider,
-            miniModel,
-            delegate,
-            delegateReply,
-        });
-        const userMessage: Message = {
+        const delegatedContent = getSummaryContent(delegateReply || "(empty response)");
+        const assistantMessage: Message = {
             id: Date.now(),
-            role: "user",
-            content: returnedDelegateMessage,
+            role: "assistant",
+            content: delegatedContent,
+            response: { type: "answer", content: delegatedContent },
             time: now(),
         };
-        const historyMessages = appendMasterMessages([userMessage]);
 
+        appendMasterMessages([assistantMessage]);
         setActiveChat({ type: "master" });
         setContextPickerOpen(false);
-        setMasterAutoResponding(true);
-
-        try {
-            const apiKey = getSavedKeyForProvider(selectedProvider);
-            const response = await sendChatMessage({
-                message: returnedDelegateMessage,
-                history: buildChatHistory(historyMessages),
-                model: selectedModel,
-                provider: selectedProvider,
-                apiKey: apiKey ?? undefined,
-            });
-            const reply = response.reply || "(empty response)";
-            if (chatGeneration !== chatGenerationRef.current) return;
-
-            const parsedReply = parseAssistantResponse(reply);
-            const assistantContent = getSummaryContent(reply);
-            const firstDelegate = getFirstDelegatePayloadFromResponse(parsedReply);
-
-            appendMasterMessages([
-                {
-                    id: Date.now() + 1,
-                    role: "assistant",
-                    content: assistantContent,
-                    response: parsedReply,
-                    time: now(),
-                },
-            ]);
-            if (firstDelegate) {
-                openDelegateDialog(firstDelegate);
-            }
-        } catch (error) {
-            if (chatGeneration !== chatGenerationRef.current) return;
-
-            const message = error instanceof Error ? error.message : "Unknown error";
-
-            appendMasterMessages([
-                {
-                    id: Date.now() + 1,
-                    role: "assistant",
-                    content: `Request failed while reprocessing delegated response: ${message}`,
-                    time: now(),
-                },
-            ]);
-        } finally {
-            if (chatGeneration === chatGenerationRef.current) {
-                setMasterAutoResponding(false);
-            }
-        }
     };
 
     const handleCreateMiniChat = (miniProvider: Provider, miniModel: string, options?: CreateMiniChatOptions) => {
@@ -440,7 +324,6 @@ function Chatbot() {
         if (options?.sendInitialPrompt && initialPrompt) {
             void sendInitialMiniPrompt(
                 id,
-                title,
                 miniProvider,
                 miniModel,
                 initialPrompt,
@@ -453,7 +336,6 @@ function Chatbot() {
 
     const sendInitialMiniPrompt = async (
         miniId: string,
-        miniTitle: string,
         miniProvider: Provider,
         miniModel: string,
         initialPrompt: string,
@@ -463,7 +345,7 @@ function Chatbot() {
     ) => {
         try {
             const apiKey = getSavedKeyForProvider(miniProvider);
-            const response = await sendChatMessage({
+            const response = await sendDelegateTaskMessage({
                 message: initialPrompt,
                 history: buildChatHistory(messages),
                 model: miniModel,
@@ -493,11 +375,7 @@ function Chatbot() {
                 ),
             );
             if (delegate) {
-                await sendDelegatedReplyToMaster({
-                    miniTitle,
-                    miniProvider,
-                    miniModel,
-                    delegate,
+                addDelegatedReplyToMaster({
                     delegateReply: reply,
                     chatGeneration,
                 });
@@ -581,7 +459,7 @@ function Chatbot() {
         try {
             const selectedProvider = mini.provider;
             const apiKey = getSavedKeyForProvider(selectedProvider);
-            const response = await sendChatMessage({
+            const response = await sendDelegateTaskMessage({
                 message: "Summarize this mini chat for adding into the main chat context. Return concise plain text only.",
                 history: buildChatHistory(mini.messages),
                 model: mini.model,
@@ -1257,7 +1135,7 @@ function Chatbot() {
                             pendingContext={activeChat.type === "master" ? pendingMasterContext : undefined}
                             onPendingContextSent={activeChat.type === "master" ? clearPendingMasterContext : undefined}
                             onDelegateResponse={openDelegateDialog}
-                            externalResponding={activeChat.type === "master" ? masterAutoResponding : false}
+                            useDelegateTaskApi={activeChat.type === "mini"}
                         />
                     ) : (
                         <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4">
